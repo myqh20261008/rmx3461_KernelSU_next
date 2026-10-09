@@ -391,40 +391,6 @@ if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
 		*) die "unknown patch step '$1'" ;;
 	esac
 fi
-
-=============================================================================
-【怎么用】本文件的全部内容都是合法 shell 代码（含注释），
-打开你 fork 的编译仓库 myqh20261008/rmx3461_KernelSU_next
--> scripts/patches.sh -> 右上角铅笔图标编辑
--> Ctrl+End 跳到文件最末尾 -> 回车另起一行 -> 粘贴本文件全部内容
--> Commit changes
-然后重新跑 Build Kernel 工作流即可。
-=============================================================================
------------------------------------------------------------------------------
-sm8350 / lahaina (android12-5.4)：关掉 KernelSU-Next 在
-drivers/kernelsu/hook/patch_memory.c 里的 pre-5.8 copy_to_kernel_nofault() 兼容宏
-patch_memory.c 里有这么一段：
-#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)
-#define copy_to_kernel_nofault(dst, src, size) probe_kernel_write(...)
-#endif
-而它出现在 #include <linux/uaccess.h> 之前。问题是这棵 crDroid 5.4 树已经把
-5.8 那次改名回移过来了：copy_to_kernel_nofault() 声明在
-include/linux/uaccess.h:311、实现在 mm/maccess.c，全树根本没有
-probe_kernel_write()。于是这个函数式宏把 uaccess.h 自己的原型也一起改写了，
-clang 直接报：
-include/linux/uaccess.h:311:37: error: type specifier missing,
-defaults to 'int' [-Werror,-Wimplicit-int]
-make[3]: *** [... drivers/kernelsu/hook/patch_memory.o] Error 1
-hook/patch_memory.o 只在 CONFIG_KSU_SYSCALL_TABLE_HOOK=y 时才会被编译 ——
-也就是我们在 5.4 上唯一能用的钩子模式，所以官方 ROM 从来没编到它、也就没发现。
-把那个 #if 改成 #if 0，宏不再定义，后面调用的就是官方回移过来的真函数。
-本段幂等：跑过一次后 grep 不再匹配，自动跳过。
------------------------------------------------------------------------------
-if [ -n "{KERNEL_DIR:-}" ] && [ -f "{KERNEL_DIR}/drivers/kernelsu/hook/patch_memory.c" ]; then
-KSU_PM_FILE="{KERNEL_DIR}/drivers/kernelsu/hook/patch_memory.c" if grep -q '^#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)' "KSU_PM_FILE"; then sed -i 's|^#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)|#if 0 /* sm8350 5.4: tree already provides copy_to_kernel_nofault(); pre-5.8 shim disabled */|' "KSU_PM_FILE" grep -qF '#if 0 /* sm8350 5.4: tree already provides' "KSU_PM_FILE"
-|| die "patch_memory.c: failed to disable the pre-5.8 copy_to_kernel_nofault() shim"
-info "patch_memory.c: pre-5.8 copy_to_kernel_nofault() shim disabled"
-else
-info "patch_memory.c: shim already disabled; nothing to do"
-fi
-fi
+sed -i 's/^#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)$/#if 0/' "$KERNEL_DIR/drivers/kernelsu/hook/patch_memory.c"
+grep -q '^#if 0$' "$KERNEL_DIR/drivers/kernelsu/hook/patch_memory.c" || die "patch_memory.c: failed to disable the pre-5.8 shim"
+echo "[*] patch_memory.c: pre-5.8 copy_to_kernel_nofault() shim disabled"
