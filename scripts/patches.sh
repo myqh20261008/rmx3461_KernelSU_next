@@ -394,3 +394,158 @@ fi
 sed -i 's/^#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 8, 0)$/#if 0/' "$KERNEL_DIR/drivers/kernelsu/hook/patch_memory.c"
 grep -q '^#if 0$' "$KERNEL_DIR/drivers/kernelsu/hook/patch_memory.c" || die "patch_memory.c: failed to disable the pre-5.8 shim"
 echo "[*] patch_memory.c: pre-5.8 copy_to_kernel_nofault() shim disabled"
+
+_kd="${KERNEL_DIR:?KERNEL_DIR must be set}"
+
+_ksu_mh_line() {
+	_f="$1"; _a="$2"; _b="$3"; _w="$4"
+	_c=$(grep -c -F -e "$_a" "$_f" 2>/dev/null || true)
+	if [ "${_c:-0}" != "1" ]; then
+		echo "[-] KSU manual hooks: anchor matched ${_c:-0} time(s) in ${_f##*/}, expected exactly 1" >&2
+		echo "[-]   anchor: $_a" >&2
+		exit 1
+	fi
+	_n=$(grep -n -F -e "$_a" "$_f" | head -n 1 | cut -d: -f1)
+	if [ -z "$_b" ]; then printf '%s' "$_n"; return 0; fi
+	awk -v s="$_n" -v w="$_w" -v p="$_b" 'NR >= s && NR <= s + w && index($0, p) > 0 { print NR; exit }' "$_f"
+}
+
+_ksu_mh_put() {
+	_f="$1"; _t="$2"; _mark="$3"; _pos="$4"
+	if grep -q -F -e "ksumh:$_mark" "$_f"; then
+		echo "[*] KSU manual hooks: ${_f##*/} '$_mark' already applied, skipping"
+		cat > /dev/null
+		return 0
+	fi
+	if [ -z "$_t" ]; then
+		echo "[-] KSU manual hooks: insertion point '$_mark' not found in ${_f##*/}" >&2
+		exit 1
+	fi
+	_s=$(mktemp)
+	cat > "$_s"
+	if [ "$_pos" = after ]; then _cut="$_t"; else _cut=$((_t - 1)); fi
+	head -n "$_cut" "$_f" > "$_f.ksumh"
+	cat "$_s" >> "$_f.ksumh"
+	tail -n "+$((_cut + 1))" "$_f" >> "$_f.ksumh"
+	mv -f "$_f.ksumh" "$_f"
+	rm -f "$_s"
+	echo "[*] KSU manual hooks: ${_f##*/} patched '$_mark' at line $_t ($_pos)"
+}
+
+echo "[*] KernelSU-Next manual hooks: integrating CONFIG_KSU_MANUAL_HOOK points"
+
+_ksu_mh_put "$_kd/fs/exec.c" "$(_ksu_mh_line "$_kd/fs/exec.c" 'static int do_execveat_common(int fd, struct filename *filename,' '' 0)" exec-extern before <<'KSU_EOF'
+/* ksumh:exec-extern */
+#ifdef CONFIG_KSU_MANUAL_HOOK
+extern bool ksu_execveat_hook;
+extern int ksu_handle_execveat(int *fd, struct filename **filename_ptr,
+			       void *argv, void *envp, int *flags);
+extern int ksu_handle_execveat_sucompat(int *fd,
+						struct filename **filename_ptr,
+						void *argv, void *envp, int *flags);
+#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/fs/exec.c" "$(_ksu_mh_line "$_kd/fs/exec.c" 'static int do_execveat_common(int fd, struct filename *filename,' 'return __do_execve_file(fd, filename, argv, envp, flags, NULL);' 20)" exec-call before <<'KSU_EOF'
+	/* ksumh:exec-call */
+	#ifdef CONFIG_KSU_MANUAL_HOOK
+	if (ksu_execveat_hook)
+		ksu_handle_execveat(&fd, &filename, &argv, &envp, &flags);
+	else
+		ksu_handle_execveat_sucompat(&fd, &filename, &argv, &envp, &flags);
+	#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/fs/open.c" "$(_ksu_mh_line "$_kd/fs/open.c" 'SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)' '' 0)" open-extern before <<'KSU_EOF'
+/* ksumh:open-extern */
+#ifdef CONFIG_KSU_MANUAL_HOOK
+extern int ksu_handle_faccessat(int *dfd, const char __user **filename_user,
+					int *mode, int *flags);
+#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/fs/open.c" "$(_ksu_mh_line "$_kd/fs/open.c" 'SYSCALL_DEFINE3(faccessat, int, dfd, const char __user *, filename, int, mode)' 'return do_faccessat(dfd, filename, mode);' 10)" open-call before <<'KSU_EOF'
+	/* ksumh:open-call */
+	#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_faccessat(&dfd, &filename, &mode, NULL);
+	#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/fs/stat.c" "$(_ksu_mh_line "$_kd/fs/stat.c" 'SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,' '' 0)" stat-newfstatat-extern before <<'KSU_EOF'
+/* ksumh:stat-newfstatat-extern */
+#ifdef CONFIG_KSU_MANUAL_HOOK
+extern int ksu_handle_stat(int *dfd, const char __user **filename_user,
+				   int *flags);
+#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/fs/stat.c" "$(_ksu_mh_line "$_kd/fs/stat.c" 'SYSCALL_DEFINE4(newfstatat, int, dfd, const char __user *, filename,' 'error = vfs_fstatat(dfd, filename, &stat, flag);' 12)" stat-newfstatat-call before <<'KSU_EOF'
+	/* ksumh:stat-newfstatat-call */
+	#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_stat(&dfd, &filename, &flag);
+	#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/fs/stat.c" "$(_ksu_mh_line "$_kd/fs/stat.c" 'SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)' '' 0)" stat-newfstat-extern before <<'KSU_EOF'
+/* ksumh:stat-newfstat-extern */
+#ifdef CONFIG_KSU_MANUAL_HOOK
+extern void ksu_handle_newfstat_ret(unsigned int *fd,
+					    struct stat __user **statbuf_ptr);
+#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/fs/stat.c" "$(_ksu_mh_line "$_kd/fs/stat.c" 'SYSCALL_DEFINE2(newfstat, unsigned int, fd, struct stat __user *, statbuf)' 'return error;' 15)" stat-newfstat-call before <<'KSU_EOF'
+	/* ksumh:stat-newfstat-call */
+	#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_newfstat_ret(&fd, &statbuf);
+	#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/fs/read_write.c" "$(_ksu_mh_line "$_kd/fs/read_write.c" 'SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)' '' 0)" read-extern before <<'KSU_EOF'
+/* ksumh:read-extern */
+#ifdef CONFIG_KSU_MANUAL_HOOK
+extern void ksu_handle_sys_read(unsigned int fd);
+#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/fs/read_write.c" "$(_ksu_mh_line "$_kd/fs/read_write.c" 'SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)' 'return ksys_read(fd, buf, count);' 10)" read-call before <<'KSU_EOF'
+	/* ksumh:read-call */
+	#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_sys_read(fd);
+	#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/drivers/input/input.c" "$(_ksu_mh_line "$_kd/drivers/input/input.c" 'void input_event(struct input_dev *dev,' '' 0)" input-extern before <<'KSU_EOF'
+/* ksumh:input-extern */
+#ifdef CONFIG_KSU_MANUAL_HOOK
+extern bool ksu_input_hook;
+extern int ksu_handle_input_handle_event(unsigned int *type,
+						 unsigned int *code, int *value);
+#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/drivers/input/input.c" "$(_ksu_mh_line "$_kd/drivers/input/input.c" 'void input_event(struct input_dev *dev,' 'if (is_event_supported(type, dev->evbit, EV_MAX)) {' 8)" input-call before <<'KSU_EOF'
+	/* ksumh:input-call */
+	#ifdef CONFIG_KSU_MANUAL_HOOK
+	if (ksu_input_hook)
+		ksu_handle_input_handle_event(&type, &code, &value);
+	#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/kernel/reboot.c" "$(_ksu_mh_line "$_kd/kernel/reboot.c" 'SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,' '' 0)" reboot-extern before <<'KSU_EOF'
+/* ksumh:reboot-extern */
+#ifdef CONFIG_KSU_MANUAL_HOOK
+extern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd,
+					 void __user **arg);
+#endif
+KSU_EOF
+
+_ksu_mh_put "$_kd/kernel/reboot.c" "$(_ksu_mh_line "$_kd/kernel/reboot.c" 'SYSCALL_DEFINE4(reboot, int, magic1, int, magic2, unsigned int, cmd,' 'int ret = 0;' 10)" reboot-call after <<'KSU_EOF'
+
+	/* ksumh:reboot-call */
+	#ifdef CONFIG_KSU_MANUAL_HOOK
+	ksu_handle_sys_reboot(magic1, magic2, cmd, &arg);
+	#endif
+KSU_EOF
+
+echo "[*] KernelSU-Next manual hooks: all integration points applied"
